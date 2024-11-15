@@ -281,6 +281,10 @@ func (v *TranscriptWorker) Handle(ctx context.Context, handler *http.ServeMux) e
 				return errors.Errorf("invalid uuid %v", uuid)
 			}
 
+			// Setze GlobalAudioTimeStreamed auf 0
+			v.task.GlobalAudioTimeStreamed = 0
+			logger.Tf(ctx, "GlobalAudioTimeStreamed reset to 0")
+
 			if err := v.task.reset(ctx); err != nil {
 				return errors.Wrapf(err, "restart task %v", uuid)
 			}
@@ -738,7 +742,7 @@ func (v *TranscriptWorker) Handle(ctx context.Context, handler *http.ServeMux) e
 			if len(uuid) == 0 {
 				return errors.Errorf("invalid uuid %v from %v of %v", uuid, fileBase, r.URL.Path)
 			}
-
+		
 			// Find out the segment by overlay vtt ID.
 			var segment *TranscriptSegment
 			for _, s := range v.task.overlaySegments() {
@@ -747,34 +751,35 @@ func (v *TranscriptWorker) Handle(ctx context.Context, handler *http.ServeMux) e
 					break
 				}
 			}
-			if segment == nil {
-				return errors.Errorf("no segment for %v", uuid)
-			}
-
-			if segment.AsrText == nil {
-				return errors.Errorf("no asr text for %v", uuid)
-			}
-			if len(segment.AsrText.Segments) == 0 {
-				return errors.Errorf("no asr text segments for %v", uuid)
-			}
-
+			
 			var vttBody strings.Builder
-			vttBody.WriteString(fmt.Sprintf("WEBVTT\n\n"))
-			for _, as := range segment.AsrText.Segments {
-				s := segment.StreamStarttime + time.Duration(as.Start*float64(time.Second))
-				e := segment.StreamStarttime + time.Duration(as.End*float64(time.Second))
-				vttBody.WriteString(fmt.Sprintf("%02d:%02d:%02d.%03d --> ",
-					int(s.Hours()), int(s.Minutes())%60, int(s.Seconds())%60, int(s.Milliseconds())%1000))
-				vttBody.WriteString(fmt.Sprintf("%02d:%02d:%02d.%03d\n",
-					int(e.Hours()), int(e.Minutes())%60, int(e.Seconds())%60, int(e.Milliseconds())%1000))
-				vttBody.WriteString(fmt.Sprintf("%v\n\n", as.Text))
+			vttBody.WriteString("WEBVTT\n\n")
+		
+			if segment == nil || segment.AsrText == nil || len(segment.AsrText.Segments) == 0 {
+				// Kein Segment gefunden, Standard-VTT-Text generieren
+				start := time.Duration(v.task.GlobalAudioTimeStreamed * float64(time.Second))
+				end := start + 4*time.Second
+				vttBody.WriteString(fmt.Sprintf("00:00:00.000 --> %02d:%02d:%02d.%03d\n",
+					int(end.Hours()), int(end.Minutes())%60, int(end.Seconds())%60, int(end.Milliseconds())%1000))
+				vttBody.WriteString(" No words are spoken\n")
+			} else {
+				// Segmente vorhanden, normale VTT-Antwort erstellen
+				for _, as := range segment.AsrText.Segments {
+					s := segment.StreamStarttime + time.Duration(as.Start*float64(time.Second))
+					e := segment.StreamStarttime + time.Duration(as.End*float64(time.Second))
+					vttBody.WriteString(fmt.Sprintf("%02d:%02d:%02d.%03d --> %02d:%02d:%02d.%03d\n",
+						int(s.Hours()), int(s.Minutes())%60, int(s.Seconds())%60, int(s.Milliseconds())%1000,
+						int(e.Hours()), int(e.Minutes())%60, int(e.Seconds())%60, int(e.Milliseconds())%1000))
+					vttBody.WriteString(fmt.Sprintf("%v\n\n", as.Text))
+				}
 			}
-
+		
 			w.Header().Set("Content-Type", "text/vtt")
 			w.Write([]byte(vttBody.String()))
 			logger.Tf(ctx, "transcript server vtt file ok, uuid=%v", uuid)
 			return nil
 		}
+		
 
 		if err := func() error {
 			if strings.HasSuffix(r.URL.Path, "/index.m3u8") {
@@ -1301,6 +1306,10 @@ type TranscriptSegment struct {
 	CostASR time.Duration `json:"asrc,omitempty"`
 	// The cost to overlay the ASR text onto the video.
 	CostOverlay time.Duration `json:"olc,omitempty"`
+
+	// New fields for storing audio start time and duration
+	AudioTimeStreamed float64
+	AudioDuration float64
 }
 
 func (v TranscriptSegment) String() string {
@@ -1490,6 +1499,8 @@ type TranscriptTask struct {
 
 	// To protect the common fields.
 	lock sync.Mutex
+
+	GlobalAudioTimeStreamed float64 // Neue SafeSpace-Variable
 }
 
 func NewTranscriptTask() *TranscriptTask {
@@ -1704,7 +1715,7 @@ func (v *TranscriptTask) DriveLiveQueue(ctx context.Context) error {
 	segment := v.LiveQueue.first()
 	starttime := time.Now()
 
-	// Remove segment if file not exists.
+	// Remove segment if file does not exist.
 	if _, err := os.Stat(segment.TsFile.File); err != nil && os.IsNotExist(err) {
 		func() {
 			v.lock.Lock()
@@ -1713,7 +1724,7 @@ func (v *TranscriptTask) DriveLiveQueue(ctx context.Context) error {
 		}()
 
 		segment.Dispose()
-		logger.Tf(ctx, "transcript: remove not exist ts segment %v", segment.String())
+		logger.Tf(ctx, "transcript: removed non-existing ts segment %v", segment.String())
 		return nil
 	}
 
@@ -1722,7 +1733,7 @@ func (v *TranscriptTask) DriveLiveQueue(ctx context.Context) error {
 		return nil
 	}
 
-	// Transcode to audio only mp4, mono, 16000HZ, 32kbps.
+	// Transcode to audio-only mp4, mono, 16000Hz, 32kbps.
 	audioFile := &TsFile{
 		TsID:     fmt.Sprintf("%v-audio-%v", segment.TsFile.SeqNo, uuid.NewString()),
 		URL:      segment.TsFile.URL,
@@ -1740,15 +1751,42 @@ func (v *TranscriptTask) DriveLiveQueue(ctx context.Context) error {
 		return errors.Wrapf(err, "transcode %v", args)
 	}
 
-	// Update the size of audio file.
+	// Use ffprobe to get only the duration of the segment
+	ffprobeArgs := []string{
+		"-v", "quiet",
+		"-show_entries", "format=duration",
+		"-of", "json",
+		audioFile.File,
+	}
+	ffprobeOutput, err := exec.CommandContext(ctx, "ffprobe", ffprobeArgs...).Output()
+	if err != nil {
+		return errors.Wrapf(err, "ffprobe %v", ffprobeArgs)
+	}
+
+	// Parse the ffprobe output for duration
+	var probeData struct {
+		Format struct {
+			Duration string `json:"duration"`
+		} `json:"format"`
+	}
+	if err := json.Unmarshal(ffprobeOutput, &probeData); err != nil {
+		return errors.Wrapf(err, "parse ffprobe output")
+	}
+
+	// Convert duration to float64
+	durationTimestamp, _ := strconv.ParseFloat(probeData.Format.Duration, 64)
+
+	// Update the size of the audio file.
 	stats, err := os.Stat(audioFile.File)
 	if err != nil {
-		// TODO: FIXME: Cleanup the failed file.
 		return errors.Wrapf(err, "stat file %v", audioFile.File)
 	}
 	audioFile.Size = uint64(stats.Size())
 
-	// Dequeue the segment from live queue and attach to asr queue.
+	// Store duration in segment metadata
+	segment.AudioDuration = durationTimestamp
+
+	// Dequeue the segment from live queue and attach to ASR queue.
 	func() {
 		v.lock.Lock()
 		defer v.lock.Unlock()
@@ -1758,13 +1796,14 @@ func (v *TranscriptTask) DriveLiveQueue(ctx context.Context) error {
 		segment.CostExtractAudio = time.Since(starttime)
 		v.AsrQueue.enqueue(segment)
 	}()
-	logger.Tf(ctx, "transcript: extract audio %v to %v, size=%v, cost=%v",
-		segment.TsFile.File, audioFile.File, audioFile.Size, segment.CostExtractAudio)
+	logger.Tf(ctx, "transcript: extract audio %v to %v, size=%v, cost=%v, duration=%.2f",
+		segment.TsFile.File, audioFile.File, audioFile.Size, segment.CostExtractAudio, durationTimestamp)
 
 	// Notify the main loop to persistent current task.
 	v.notifyPersistence(ctx)
 	return nil
 }
+
 
 func (v *TranscriptTask) DriveAsrQueue(ctx context.Context) error {
 	// Ignore if not enabled.
@@ -1803,8 +1842,6 @@ func (v *TranscriptTask) DriveAsrQueue(ctx context.Context) error {
 	config.BaseURL = v.config.BaseURL
 	config.OrgID = v.config.Organization
 
-	// TODO: FIXME: Fast retry when failed.
-	// TODO: FIXME: Use smaller timeout.
 	client := openai.NewClientWithConfig(config)
 	prompt := v.PreviousAsrText
 	resp, err := client.CreateTranscription(
@@ -1818,11 +1855,11 @@ func (v *TranscriptTask) DriveAsrQueue(ctx context.Context) error {
 		},
 	)
 	if err != nil {
-		// TODO: FIXME: Cleanup the failed file.
 		return errors.Wrapf(err, "transcription %v", segment.String())
 	}
+	fmt.Println("Whisper Answer:", resp)
 
-	// Discover the starttime of the segment.
+	// Retrieve the start time of the segment.
 	stdout, err := exec.CommandContext(ctx, "ffprobe",
 		"-show_error", "-show_private_data", "-v", "quiet", "-find_stream_info", "-print_format", "json",
 		"-show_format", "-show_streams", segment.TsFile.File,
@@ -1844,25 +1881,41 @@ func (v *TranscriptTask) DriveAsrQueue(ctx context.Context) error {
 
 	// Build SRT file from ASR result.
 	var srt strings.Builder
-	for index, srtSegment := range resp.Segments {
-		// Write the index.
-		srt.WriteString(fmt.Sprintf("%v\n", index))
 
-		// Write the start and end time.
-		s := segment.StreamStarttime + time.Duration(srtSegment.Start*float64(time.Second))
-		e := segment.StreamStarttime + time.Duration(srtSegment.End*float64(time.Second))
-		srt.WriteString(fmt.Sprintf("%02d:%02d:%02d,%03d --> ",
-			int(s.Hours()), int(s.Minutes())%60, int(s.Seconds())%60, int(s.Milliseconds())%1000))
-		srt.WriteString(fmt.Sprintf("%02d:%02d:%02d,%03d\n",
-			int(e.Hours()), int(e.Minutes())%60, int(e.Seconds())%60, int(e.Milliseconds())%1000))
+	// Check if Whisper returned any segments; if not, create a placeholder.
+	if len(resp.Segments) == 0 {
+		// Calculate the start and end time based on AudioTimeStreamed if no segments were returned
+		start := time.Duration(v.GlobalAudioTimeStreamed * float64(time.Second))
+		end := start + 4*time.Second
+	
+		srt.WriteString("1\n")
+		srt.WriteString(fmt.Sprintf("%02d:%02d:%02d,%03d --> %02d:%02d:%02d,%03d\n",
+			int(start.Hours()), int(start.Minutes())%60, int(start.Seconds())%60, int(start.Milliseconds())%1000,
+			int(end.Hours()), int(end.Minutes())%60, int(end.Seconds())%60, int(end.Milliseconds())%1000))
+		srt.WriteString(" no words are spoken\n\n")
+		resp.Text = " no words are spoken"
+	} else {
+		// If there are segments, construct the SRT content from them.
+		for index, srtSegment := range resp.Segments {
+			srt.WriteString(fmt.Sprintf("%v\n", index+1))
 
-		// Write the subtitle text.
-		srt.WriteString(fmt.Sprintf("%v\n", srtSegment.Text))
+			// Calculate start and end times based on segment data.
+			s := segment.StreamStarttime + time.Duration(srtSegment.Start*float64(time.Second))
+			e := segment.StreamStarttime + time.Duration(srtSegment.End*float64(time.Second))
+			srt.WriteString(fmt.Sprintf("%02d:%02d:%02d,%03d --> %02d:%02d:%02d,%03d\n",
+				int(s.Hours()), int(s.Minutes())%60, int(s.Seconds())%60, int(s.Milliseconds())%1000,
+				int(e.Hours()), int(e.Minutes())%60, int(e.Seconds())%60, int(e.Milliseconds())%1000))
 
-		// Insert a new line.
-		srt.WriteString("\n")
+			// Use default text if the segment text is empty.
+			text := srtSegment.Text
+			if text == "" {
+				text = " no words are spoken"
+			}
+			srt.WriteString(fmt.Sprintf("%v\n\n", text))
+		}
 	}
 
+	// Save the SRT file.
 	fileName := path.Join("transcript", fmt.Sprintf("%v.srt", segment.AudioFile.TsID))
 	if f, err := os.OpenFile(fileName, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644); err != nil {
 		return errors.Wrapf(err, "open file %v", fileName)
@@ -1873,9 +1926,14 @@ func (v *TranscriptTask) DriveAsrQueue(ctx context.Context) error {
 		}
 	}
 
+	// GlobalAudioTimeStreamed inkrementieren
+    v.GlobalAudioTimeStreamed += segment.AudioDuration
+	fmt.Println("TimeStreamed:", v.GlobalAudioTimeStreamed, "AudioDuration", segment.AudioDuration)
+
 	segment.SrtFile = fileName
 
-	// Dequeue the segment from asr queue and attach to correct queue.
+
+	// Dequeue the segment from the ASR queue and attach to the correct queue.
 	func() {
 		v.lock.Lock()
 		defer v.lock.Unlock()
@@ -1906,7 +1964,7 @@ func (v *TranscriptTask) DriveAsrQueue(ctx context.Context) error {
 	logger.Tf(ctx, "transcript: asr audio=%v, prompt=%v, text=%v, cost=%v",
 		segment.AudioFile.File, prompt, resp.Text, segment.CostASR)
 
-	// Notify the main loop to persistent current task.
+	// Notify the main loop to persist the current task state.
 	v.notifyPersistence(ctx)
 	return nil
 }
@@ -2019,6 +2077,10 @@ func (v *TranscriptTask) DriveFixQueue(ctx context.Context) error {
 
 	// Notify the main loop to persistent current task.
 	v.notifyPersistence(ctx)
+	return nil
+
+	// GlobalAudioTimeStreamed nur beim kompletten Reset zurücksetzen
+	v.GlobalAudioTimeStreamed = 0
 	return nil
 }
 
